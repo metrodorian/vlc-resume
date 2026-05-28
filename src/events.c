@@ -59,8 +59,14 @@ int IntfEventCallback(vlc_object_t *p_obj, const char *psz_var,
                 if (state_load_position(psz_file, psz_mrl, &i_ms)
                     && i_ms > RESUME_THRESHOLD_MS)
                 {
-                    /* var_SetInteger("time") seeks to vlc_tick_t position. */
-                    var_SetInteger(p_input, "time", VLC_TICK_FROM_MS(i_ms));
+                    /* Defer the actual seek to the timer thread. Calling the
+                     * blocking var_SetInteger("time") here would re-enter the
+                     * input thread (this callback runs on it) and deadlock
+                     * against the input control / UI threads. */
+                    vlc_mutex_lock(&p_sys->lock);
+                    p_sys->i_seek_target_ms = i_ms;
+                    p_sys->b_seek_pending   = true;
+                    vlc_mutex_unlock(&p_sys->lock);
                 }
             }
             free(psz_mrl);
@@ -122,6 +128,7 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
     p_sys->i_time_ms        = 0;
     p_sys->b_dirty          = false;
     p_sys->b_resumed        = false;
+    p_sys->b_seek_pending   = false;
 
     vlc_mutex_unlock(&p_sys->lock);
 

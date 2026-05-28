@@ -15,6 +15,8 @@ struct intf_sys_t {
     int64_t          i_time_ms;         /* last known position in milliseconds */
     bool             b_dirty;           /* position changed since last write */
     bool             b_resumed;         /* seek already performed for this track */
+    bool             b_seek_pending;    /* timer thread should seek p_input */
+    int64_t          i_seek_target_ms;  /* target position for the pending seek */
     bool             b_resume_pending;  /* true until the one-time resume jump is decided */
 
     playlist_t      *p_playlist;

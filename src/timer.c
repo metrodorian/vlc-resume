@@ -12,6 +12,8 @@
 #include "vlc_resume_utils.h"
 
 #define SAVE_INTERVAL VLC_TICK_FROM_SEC(5)
+/* Poll fast so a deferred resume seek is applied with minimal latency. */
+#define POLL_INTERVAL VLC_TICK_FROM_MS(200)
 
 void *TimerThread(void *p_data)
 {
@@ -21,12 +23,33 @@ void *TimerThread(void *p_data)
     vlc_tick_t next_save = mdate() + SAVE_INTERVAL;
 
     for (;;) {
-        vlc_tick_t now  = mdate();
-        vlc_tick_t wait = next_save - now;
-        if (wait > 0)
-            msleep(wait);
-
+        msleep(POLL_INTERVAL);
         vlc_testcancel();
+
+        /* Perform any seek deferred by IntfEventCallback. Running it here,
+         * off the input event thread, avoids the re-entrant deadlock that
+         * a synchronous var_SetInteger("time") would cause inside the
+         * callback. We hold a reference to the input across the blocking
+         * call so it cannot be released underneath us. */
+        vlc_mutex_lock(&p_sys->lock);
+        bool             do_seek = p_sys->b_seek_pending;
+        int64_t          seek_ms = p_sys->i_seek_target_ms;
+        input_thread_t  *p_seek  = NULL;
+        if (do_seek) {
+            p_sys->b_seek_pending = false;
+            p_seek = p_sys->p_input;
+            if (p_seek)
+                vlc_object_hold(p_seek);
+        }
+        vlc_mutex_unlock(&p_sys->lock);
+
+        if (p_seek) {
+            var_SetInteger(p_seek, "time", VLC_TICK_FROM_MS(seek_ms));
+            vlc_object_release(p_seek);
+        }
+
+        if (mdate() < next_save)
+            continue;
 
         next_save = mdate() + SAVE_INTERVAL;
 
