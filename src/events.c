@@ -12,54 +12,10 @@
 #include "plugin.h"
 #include "events.h"
 #include "state.h"
+#include "vlc_resume_utils.h"
 
 /* Minimum stored position before we attempt a resume seek (10 seconds). */
 #define RESUME_THRESHOLD_MS 10000
-
-/* ---------- Playlist snapshot --------------------------------------------- */
-
-/*
- * Collect MRLs of all direct children of p_playlist->p_playing into a
- * freshly malloc'd array. Caller must free each string and the array itself.
- * Returns NULL on failure.
- */
-static char **playlist_snapshot(playlist_t *p_pl, int *p_count)
-{
-    PL_LOCK;
-    playlist_item_t *p_playing = p_pl->p_playing;
-    int n = p_playing ? p_playing->i_children : 0;
-    char **ppsz = (n > 0) ? malloc((size_t)n * sizeof(char *)) : NULL;
-    if (ppsz) {
-        for (int i = 0; i < n; i++) {
-            playlist_item_t *ch = p_playing->pp_children[i];
-            ppsz[i] = (ch && ch->p_input)
-                      ? input_item_GetURI(ch->p_input)
-                      : strdup("");
-        }
-    }
-    PL_UNLOCK;
-    *p_count = ppsz ? n : 0;
-    return ppsz;
-}
-
-static void snapshot_free(char **ppsz, int n)
-{
-    for (int i = 0; i < n; i++) free(ppsz[i]);
-    free(ppsz);
-}
-
-/*
- * Return true if both MRL arrays have the same length and identical content.
- */
-static bool playlists_match(const char * const *a, int na,
-                            const char * const *b, int nb)
-{
-    if (na != nb || na == 0) return false;
-    for (int i = 0; i < na; i++)
-        if (strcmp(a[i] ? a[i] : "", b[i] ? b[i] : "") != 0)
-            return false;
-    return true;
-}
 
 /* ---------- intf-event callback ------------------------------------------- */
 
@@ -130,130 +86,134 @@ int IntfEventCallback(vlc_object_t *p_obj, const char *psz_var,
 
 /* ---------- input-current callback ---------------------------------------- */
 
+/*
+ * Lock discipline:
+ *   p_sys->lock and PL_LOCK must NEVER be held simultaneously.
+ *   All disk I/O and playlist queries run without either or only one lock.
+ */
 int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
                          vlc_value_t old_val, vlc_value_t new_val,
                          void *p_data)
 {
     VLC_UNUSED(psz_var); VLC_UNUSED(old_val); VLC_UNUSED(p_obj);
 
-    intf_thread_t  *p_intf       = (intf_thread_t *)p_data;
-    intf_sys_t     *p_sys        = p_intf->p_sys;
-    input_thread_t *p_input_new  = new_val.p_address;
+    intf_thread_t  *p_intf      = (intf_thread_t *)p_data;
+    intf_sys_t     *p_sys       = p_intf->p_sys;
+    input_thread_t *p_input_new = new_val.p_address;
 
+    /* ---- 1. Grab everything about the leaving track under lock. ---------- */
     vlc_mutex_lock(&p_sys->lock);
 
-    /* Detach callback + release hold on the old input. */
     input_thread_t *p_input_old = p_sys->p_input;
     p_sys->p_input = NULL;
 
-    /* Save current position before we lose the MRL. */
-    if (p_sys->b_dirty && p_sys->psz_current_mrl && p_sys->i_time_ms > 0)
-        state_save_position(p_sys->psz_state_file,
-                            p_sys->psz_current_mrl, p_sys->i_time_ms);
+    /* Take ownership of the old MRL string — avoids a strdup. */
+    char   *psz_old_mrl = p_sys->psz_current_mrl;
+    p_sys->psz_current_mrl = NULL;
 
-    /* Update last_session with the track we just left. */
-    if (p_sys->psz_current_mrl && p_sys->i_playlist_index >= 0) {
-        int    snap_count = 0;
-        char **ppsz_snap  = NULL;
-        /* Unlock briefly to call playlist_snapshot (it takes PL_LOCK). */
-        vlc_mutex_unlock(&p_sys->lock);
-        ppsz_snap = playlist_snapshot(p_sys->p_playlist, &snap_count);
-        vlc_mutex_lock(&p_sys->lock);
+    int64_t i_old_ms  = p_sys->i_time_ms;
+    int     i_old_idx = p_sys->i_playlist_index;
+    bool    b_dirty   = p_sys->b_dirty;
+    bool    b_startup = p_sys->b_is_startup;
+    char   *psz_file  = p_sys->psz_state_file
+                        ? strdup(p_sys->psz_state_file) : NULL;
 
-        if (ppsz_snap && snap_count > 0)
-            session_save(p_sys->psz_state_file,
-                         (const char * const *)ppsz_snap, snap_count,
-                         p_sys->i_playlist_index,
-                         p_sys->psz_current_mrl,
-                         p_sys->i_time_ms);
-        snapshot_free(ppsz_snap, snap_count);
-    }
-
-    bool b_is_startup = p_sys->b_is_startup;
-    p_sys->b_is_startup = false;
-
-    free(p_sys->psz_current_mrl);
-    p_sys->psz_current_mrl  = NULL;
     p_sys->i_time_ms        = 0;
     p_sys->i_playlist_index = -1;
     p_sys->b_dirty          = false;
     p_sys->b_resumed        = false;
-
-    if (p_input_new) {
-        char *psz_uri = input_item_GetURI(input_GetItem(p_input_new));
-        if (psz_uri) {
-            p_sys->psz_current_mrl = psz_uri;
-            p_sys->p_input = vlc_object_hold(p_input_new);
-
-            /* Determine current playlist index. */
-            playlist_item_t *p_item =
-                playlist_ItemGetByInput(p_sys->p_playlist,
-                                        input_GetItem(p_input_new));
-            if (p_item)
-                p_sys->i_playlist_index = p_item->i_id; /* use array index below */
-        }
-    }
+    p_sys->b_is_startup     = false;
 
     vlc_mutex_unlock(&p_sys->lock);
 
-    /* Detach callback from the old input now that we hold no lock. */
+    /* ---- 2. Detach callback from old input (no lock held). --------------- */
     if (p_input_old) {
         var_DelCallback(p_input_old, "intf-event", IntfEventCallback, p_intf);
         vlc_object_release(p_input_old);
     }
 
-    /* Attach callback to new input. */
-    if (p_input_new)
-        var_AddCallback(p_input_new, "intf-event", IntfEventCallback, p_intf);
+    /* ---- 3. Persist leaving-track state (no lock, no PL_LOCK). ---------- */
+    if (b_dirty && psz_old_mrl && psz_file && i_old_ms > 0)
+        state_save_position(psz_file, psz_old_mrl, i_old_ms);
 
-    /*
-     * Playlist resume on startup: if this is the very first track and it does
-     * NOT match the saved session's last track, check whether the current
-     * playlist matches the saved session. If so, jump to the saved track index.
-     * The subsequent PLAYING_S event will then seek to the saved millisecond.
-     */
-    if (b_is_startup && p_input_new) {
-        session_t sess;
-        char     *psz_state = NULL;
+    if (psz_old_mrl && i_old_idx >= 0 && psz_file) {
+        int    snap_n = 0;
+        char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
+        if (snap && snap_n > 0)
+            session_save(psz_file, (const char * const *)snap, snap_n,
+                         i_old_idx, psz_old_mrl, i_old_ms);
+        snapshot_free(snap, snap_n);
+    }
+
+    free(psz_old_mrl);
+
+    /* ---- 4. Set up arriving track (PL_LOCK only, then p_sys->lock). ----- */
+    char *psz_new_mrl = NULL;
+    int   i_new_idx   = -1;
+
+    if (p_input_new) {
+        input_item_t *p_iitem = input_GetItem(p_input_new);
+        psz_new_mrl = input_item_GetURI(p_iitem);
+        i_new_idx   = playlist_find_index(p_sys->p_playlist, p_iitem);
 
         vlc_mutex_lock(&p_sys->lock);
-        psz_state = p_sys->psz_state_file ? strdup(p_sys->psz_state_file) : NULL;
+        if (psz_new_mrl) {
+            p_sys->psz_current_mrl  = psz_new_mrl;
+            p_sys->i_playlist_index = i_new_idx;
+            p_sys->p_input          = vlc_object_hold(p_input_new);
+        }
         vlc_mutex_unlock(&p_sys->lock);
 
-        if (psz_state && session_load(psz_state, &sess)) {
-            int    snap_count = 0;
-            char **ppsz_snap  = playlist_snapshot(p_sys->p_playlist,
-                                                   &snap_count);
+        var_AddCallback(p_input_new, "intf-event", IntfEventCallback, p_intf);
+    }
 
-            if (playlists_match((const char * const *)ppsz_snap, snap_count,
-                                (const char * const *)sess.ppsz_tracks,
-                                sess.i_track_count))
+    /* ---- 5. On very first track: check for playlist resume. -------------- */
+    if (b_startup && p_input_new && psz_file) {
+        session_t sess;
+        if (session_load(psz_file, &sess)) {
+            int    snap_n = 0;
+            char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
+
+            if (snap && playlists_match((const char * const *)snap, snap_n,
+                                        (const char * const *)sess.ppsz_tracks,
+                                        sess.i_track_count))
             {
-                /* Find the saved track by MRL inside the current playlist. */
-                int target_idx = -1;
-                for (int i = 0; i < snap_count; i++) {
-                    if (ppsz_snap[i] && strcmp(ppsz_snap[i], sess.psz_mrl) == 0) {
-                        target_idx = i;
+                /* Find the saved track by MRL. */
+                int target = -1;
+                for (int i = 0; i < snap_n; i++) {
+                    if (snap[i] && sess.psz_mrl
+                        && strcmp(snap[i], sess.psz_mrl) == 0) {
+                        target = i;
                         break;
                     }
                 }
-                if (target_idx >= 0 && target_idx != 0) {
-                    /* Navigate to the saved track; PLAYING_S will seek. */
+                /* Only jump if not already on the right track. */
+                if (target > 0) {
                     PL_LOCK;
-                    playlist_item_t *p_playing =
-                        p_sys->p_playlist->p_playing;
-                    if (p_playing && target_idx < p_playing->i_children)
+                    playlist_item_t *p_playing = p_sys->p_playlist->p_playing;
+                    if (p_playing && target < p_playing->i_children)
                         playlist_ViewPlay(p_sys->p_playlist, p_playing,
-                                          p_playing->pp_children[target_idx]);
+                                          p_playing->pp_children[target]);
                     PL_UNLOCK;
                 }
             }
 
-            snapshot_free(ppsz_snap, snap_count);
+            snapshot_free(snap, snap_n);
             session_free(&sess);
         }
-        free(psz_state);
     }
 
+    free(psz_file);
     return VLC_SUCCESS;
+}
+
+/* Exposed for use by timer.c via events.h */
+bool playlists_match(const char * const *a, int na,
+                     const char * const *b, int nb)
+{
+    if (na != nb || na == 0) return false;
+    for (int i = 0; i < na; i++)
+        if (strcmp(a[i] ? a[i] : "", b[i] ? b[i] : "") != 0)
+            return false;
+    return true;
 }

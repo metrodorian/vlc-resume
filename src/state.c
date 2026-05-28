@@ -131,18 +131,6 @@ bool state_save_position(const char *psz_file, const char *psz_mrl,
     else
         cJSON_AddNumberToObject(pos, psz_mrl, (double)i_ms);
 
-    /* Also keep last_session.ms in sync for the currently active track. */
-    cJSON *sess = cJSON_GetObjectItemCaseSensitive(root, "last_session");
-    if (sess && cJSON_IsObject(sess)) {
-        cJSON *sess_mrl = cJSON_GetObjectItemCaseSensitive(sess, "mrl");
-        if (sess_mrl && cJSON_IsString(sess_mrl)
-            && strcmp(sess_mrl->valuestring, psz_mrl) == 0)
-        {
-            cJSON *sess_ms = cJSON_GetObjectItemCaseSensitive(sess, "ms");
-            if (sess_ms) cJSON_SetNumberValue(sess_ms, (double)i_ms);
-        }
-    }
-
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!out) return false;

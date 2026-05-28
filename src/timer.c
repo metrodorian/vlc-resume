@@ -8,11 +8,8 @@
 
 #include "timer.h"
 #include "state.h"
-
-/* Forward declaration — intf_sys_t is defined in plugin.c */
-typedef struct intf_sys_t intf_sys_t;
-
 #include "plugin.h"
+#include "vlc_resume_utils.h"
 
 /* Interval between disk writes (5 seconds). */
 #define SAVE_INTERVAL VLC_TICK_FROM_SEC(5)
@@ -30,21 +27,42 @@ void *TimerThread(void *p_data)
         if (wait > 0)
             vlc_tick_sleep(wait);
 
-        /* Check cancellation after wakeup. */
         vlc_testcancel();
 
         next_save = vlc_tick_now() + SAVE_INTERVAL;
 
+        /* Snapshot the fields we need under lock, then release immediately.
+         * Disk I/O and PL_LOCK must NOT be taken while holding p_sys->lock. */
         vlc_mutex_lock(&p_sys->lock);
-        bool dirty       = p_sys->b_dirty;
-        char *psz_mrl    = dirty ? strdup(p_sys->psz_current_mrl) : NULL;
+        bool    b_dirty  = p_sys->b_dirty;
+        char   *psz_mrl  = (b_dirty && p_sys->psz_current_mrl)
+                           ? strdup(p_sys->psz_current_mrl) : NULL;
         int64_t i_ms     = p_sys->i_time_ms;
-        char *psz_file   = dirty ? strdup(p_sys->psz_state_file)  : NULL;
+        int     i_idx    = p_sys->i_playlist_index;
+        char   *psz_file = (b_dirty && p_sys->psz_state_file)
+                           ? strdup(p_sys->psz_state_file) : NULL;
         p_sys->b_dirty   = false;
         vlc_mutex_unlock(&p_sys->lock);
 
-        if (dirty && psz_mrl && psz_file && i_ms > 0)
-            state_save_position(psz_file, psz_mrl, i_ms);
+        if (!b_dirty || !psz_mrl || !psz_file || i_ms <= 0) {
+            free(psz_mrl);
+            free(psz_file);
+            continue;
+        }
+
+        /* Write per-track position. */
+        state_save_position(psz_file, psz_mrl, i_ms);
+
+        /* Write last_session — this is what keeps playlist resume crash-safe.
+         * PL_LOCK is taken inside playlist_snapshot, never with p_sys->lock. */
+        if (i_idx >= 0) {
+            int    snap_n = 0;
+            char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
+            if (snap && snap_n > 0)
+                session_save(psz_file, (const char * const *)snap, snap_n,
+                             i_idx, psz_mrl, i_ms);
+            snapshot_free(snap, snap_n);
+        }
 
         free(psz_mrl);
         free(psz_file);
