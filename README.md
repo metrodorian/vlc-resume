@@ -8,7 +8,8 @@ A VLC interface plugin that automatically saves the current playback position ev
 - Position saved per MRL — multiple files tracked independently in one JSON file
 - Crash-safe: atomic write via `.tmp` + `rename()` / `MoveFileEx`
 - Skips resume if saved position is under 10 seconds (treat as "just started")
-- Deletes the entry when a track finishes cleanly (`INPUT_EVENT_EOF`)
+- Deletes the entry when a track finishes cleanly (`INPUT_EVENT_STATE` → `END_S`)
+- Playlist-level resume: reopening the same playlist jumps to the same track and second
 - No UI, no configuration needed — runs silently as a background interface module
 
 ## State file
@@ -64,18 +65,62 @@ cmake --build build
 cmake --install build
 ```
 
-This copies the plugin to the per-user VLC plugin directory. Restart VLC — the plugin activates automatically on startup.
+This copies the plugin to the per-user VLC plugin directory
+(`~/.local/lib/vlc/plugins` on macOS/Linux).
 
-To verify it loaded:
+### Auto-load on every VLC start
+
+The plugin lives outside the signed `VLC.app` bundle, so VLC must be told where
+to find it (`VLC_PLUGIN_PATH`) and which extra interface to load (`extraintf`).
+
+**1. Enable the interface** in `vlcrc`
+(`~/Library/Preferences/org.videolan.vlc/vlcrc` on macOS):
+```ini
+extraintf=vlc_resume
+```
+
+**2. Export `VLC_PLUGIN_PATH` globally (macOS LaunchAgent).**
+Create `~/Library/LaunchAgents/org.videolan.vlc.pluginpath.plist`:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.videolan.vlc.pluginpath</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/launchctl</string>
+        <string>setenv</string>
+        <string>VLC_PLUGIN_PATH</string>
+        <string>/Users/YOUR_USER/.local/lib/vlc/plugins</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+```
+Then load it (runs automatically at every login afterwards):
+```bash
+launchctl load ~/Library/LaunchAgents/org.videolan.vlc.pluginpath.plist
+launchctl getenv VLC_PLUGIN_PATH   # should print the plugin dir
+```
+
+Restart VLC. To verify the plugin loaded:
 ```
 Tools → Messages (Ctrl+M) → filter "resume"
+```
+Or from the command line:
+```bash
+VLC_PLUGIN_PATH="$HOME/.local/lib/vlc/plugins" \
+  /Applications/VLC.app/Contents/MacOS/VLC -I dummy --list 2>&1 | grep resume
 ```
 
 ## Architecture
 
 ```
 plugin.c   — Open() / Close(), module descriptor
-events.c   — InputCurrentCallback (track change), IntfEventCallback (position/state/EOF)
+events.c   — InputCurrentCallback (track change), IntfEventCallback (position/state)
 timer.c    — background thread, flushes dirty flag to disk every 5 s
 state.c    — read/write/delete entries in resume.json (atomic)
 cJSON.c/h  — embedded cJSON v1.7.17 (MIT)

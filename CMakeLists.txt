@@ -53,6 +53,7 @@ target_include_directories(vlc_resume PRIVATE
 )
 
 target_compile_definitions(vlc_resume PRIVATE
+    __PLUGIN__=1
     HAVE_CONFIG_H=1
     MODULE_STRING="vlc_resume"
     cJSON_HIDE_SYMBOLS
