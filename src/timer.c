@@ -37,7 +37,6 @@ void *TimerThread(void *p_data)
         char   *psz_mrl  = (b_dirty && p_sys->psz_current_mrl)
                            ? strdup(p_sys->psz_current_mrl) : NULL;
         int64_t i_ms     = p_sys->i_time_ms;
-        int     i_idx    = p_sys->i_playlist_index;
         char   *psz_file = (b_dirty && p_sys->psz_state_file)
                            ? strdup(p_sys->psz_state_file) : NULL;
         p_sys->b_dirty   = false;
@@ -53,13 +52,16 @@ void *TimerThread(void *p_data)
         state_save_position(psz_file, psz_mrl, i_ms);
 
         /* Write last_session — crash-safe playlist resume.
-         * PL_LOCK taken inside playlist_snapshot, never with p_sys->lock. */
-        if (i_idx >= 0) {
+         * PL_LOCK taken inside playlist_snapshot, never with p_sys->lock.
+         * Derive the index from the snapshot by MRL: skips container items
+         * (e.g. the .m3u8 itself) whose MRL is not among the real tracks. */
+        {
             int    snap_n = 0;
             char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
-            if (snap && snap_n > 0)
+            int    idx    = snapshot_index_of(snap, snap_n, psz_mrl);
+            if (snap && snap_n > 0 && idx >= 0)
                 session_save(psz_file, (const char * const *)snap, snap_n,
-                             i_idx, psz_mrl, i_ms);
+                             idx, psz_mrl, i_ms);
             snapshot_free(snap, snap_n);
         }
 

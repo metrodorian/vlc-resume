@@ -39,25 +39,19 @@ static inline void snapshot_free(char **ppsz, int n)
 }
 
 /*
- * Find the 0-based pp_children index of the item whose p_input matches
- * p_iitem. Returns -1 if not found.
+ * Return the index of psz_mrl within a snapshot, or -1 if absent.
+ * Matching by MRL string is robust against VLC's subitem handling, where
+ * the playing track's input_item_t pointer does not equal the playlist
+ * child's pointer (e.g. tracks expanded from an .m3u8 container).
  */
-static inline int playlist_find_index(playlist_t *p_pl, input_item_t *p_iitem)
+static inline int snapshot_index_of(char * const *snap, int n,
+                                     const char *psz_mrl)
 {
-    int idx = -1;
-    playlist_Lock(p_pl);
-    playlist_item_t *p_playing = p_pl->p_playing;
-    if (p_playing && p_iitem) {
-        for (int i = 0; i < p_playing->i_children; i++) {
-            playlist_item_t *ch = p_playing->pp_children[i];
-            if (ch && ch->p_input == p_iitem) {
-                idx = i;
-                break;
-            }
-        }
-    }
-    playlist_Unlock(p_pl);
-    return idx;
+    if (!snap || !psz_mrl) return -1;
+    for (int i = 0; i < n; i++)
+        if (snap[i] && strcmp(snap[i], psz_mrl) == 0)
+            return i;
+    return -1;
 }
 
 #endif /* VLC_RESUME_UTILS_H */

@@ -39,8 +39,7 @@ static int Open(vlc_object_t *p_this)
 
     p_intf->p_sys = p_sys;
     vlc_mutex_init(&p_sys->lock);
-    p_sys->b_is_startup      = true;
-    p_sys->i_playlist_index  = -1;
+    p_sys->b_resume_pending  = true;
 
     /* Build path to state file: <vlc-data-dir>/resume.json */
     char *psz_dir = config_GetUserDir(VLC_DATA_DIR);
