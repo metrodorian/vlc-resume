@@ -6,7 +6,8 @@
 #include <vlc_interface.h>
 #include <vlc_input.h>
 #include <vlc_playlist.h>
-#include <vlc_tick.h>
+#include <vlc_mtime.h>
+#include <vlc_variables.h>
 #include <vlc_url.h>
 
 #include "plugin.h"
@@ -31,8 +32,9 @@ int IntfEventCallback(vlc_object_t *p_obj, const char *psz_var,
     int             i_event = new_val.i_int;
 
     if (i_event == INPUT_EVENT_POSITION) {
-        vlc_tick_t t  = var_GetTime(p_input, "time");
-        int64_t    ms = MS_FROM_VLC_TICK(t);
+        /* var_GetInteger("time") returns vlc_tick_t (microseconds). */
+        int64_t t_us = var_GetInteger(p_input, "time");
+        int64_t ms   = MS_FROM_VLC_TICK(t_us);
 
         vlc_mutex_lock(&p_sys->lock);
         if (p_sys->psz_current_mrl) {
@@ -57,28 +59,29 @@ int IntfEventCallback(vlc_object_t *p_obj, const char *psz_var,
                 if (state_load_position(psz_file, psz_mrl, &i_ms)
                     && i_ms > RESUME_THRESHOLD_MS)
                 {
-                    var_SetTime(p_input, "time", VLC_TICK_FROM_MS(i_ms));
+                    /* var_SetInteger("time") seeks to vlc_tick_t position. */
+                    var_SetInteger(p_input, "time", VLC_TICK_FROM_MS(i_ms));
                 }
             }
             free(psz_mrl);
             free(psz_file);
         }
-    }
-    else if (i_event == INPUT_EVENT_EOF) {
-        /* Track finished cleanly — remove saved position. */
-        vlc_mutex_lock(&p_sys->lock);
-        char *psz_mrl  = p_sys->psz_current_mrl
-                         ? strdup(p_sys->psz_current_mrl) : NULL;
-        char *psz_file = p_sys->psz_state_file
-                         ? strdup(p_sys->psz_state_file)  : NULL;
-        p_sys->b_dirty = false;
-        vlc_mutex_unlock(&p_sys->lock);
+        else if (i_state == END_S) {
+            /* Track finished cleanly — remove saved position. */
+            vlc_mutex_lock(&p_sys->lock);
+            char *psz_mrl  = p_sys->psz_current_mrl
+                             ? strdup(p_sys->psz_current_mrl) : NULL;
+            char *psz_file = p_sys->psz_state_file
+                             ? strdup(p_sys->psz_state_file)  : NULL;
+            p_sys->b_dirty = false;
+            vlc_mutex_unlock(&p_sys->lock);
 
-        if (psz_mrl && psz_file)
-            state_delete_position(psz_file, psz_mrl);
+            if (psz_mrl && psz_file)
+                state_delete_position(psz_file, psz_mrl);
 
-        free(psz_mrl);
-        free(psz_file);
+            free(psz_mrl);
+            free(psz_file);
+        }
     }
 
     return VLC_SUCCESS;
@@ -88,7 +91,7 @@ int IntfEventCallback(vlc_object_t *p_obj, const char *psz_var,
 
 /*
  * Lock discipline:
- *   p_sys->lock and PL_LOCK must NEVER be held simultaneously.
+ *   p_sys->lock and playlist_Lock must NEVER be held simultaneously.
  *   All disk I/O and playlist queries run without either or only one lock.
  */
 int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
@@ -107,8 +110,7 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
     input_thread_t *p_input_old = p_sys->p_input;
     p_sys->p_input = NULL;
 
-    /* Take ownership of the old MRL string — avoids a strdup. */
-    char   *psz_old_mrl = p_sys->psz_current_mrl;
+    char   *psz_old_mrl = p_sys->psz_current_mrl; /* take ownership */
     p_sys->psz_current_mrl = NULL;
 
     int64_t i_old_ms  = p_sys->i_time_ms;
@@ -132,7 +134,7 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
         vlc_object_release(p_input_old);
     }
 
-    /* ---- 3. Persist leaving-track state (no lock, no PL_LOCK). ---------- */
+    /* ---- 3. Persist leaving-track state (no lock, no playlist_Lock). ---- */
     if (b_dirty && psz_old_mrl && psz_file && i_old_ms > 0)
         state_save_position(psz_file, psz_old_mrl, i_old_ms);
 
@@ -147,7 +149,7 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
 
     free(psz_old_mrl);
 
-    /* ---- 4. Set up arriving track (PL_LOCK only, then p_sys->lock). ----- */
+    /* ---- 4. Set up arriving track (playlist_Lock only, then p_sys->lock). */
     char *psz_new_mrl = NULL;
     int   i_new_idx   = -1;
 
@@ -178,7 +180,6 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
                                         (const char * const *)sess.ppsz_tracks,
                                         sess.i_track_count))
             {
-                /* Find the saved track by MRL. */
                 int target = -1;
                 for (int i = 0; i < snap_n; i++) {
                     if (snap[i] && sess.psz_mrl
@@ -187,14 +188,13 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
                         break;
                     }
                 }
-                /* Only jump if not already on the right track. */
                 if (target > 0) {
-                    PL_LOCK;
+                    playlist_Lock(p_sys->p_playlist);
                     playlist_item_t *p_playing = p_sys->p_playlist->p_playing;
                     if (p_playing && target < p_playing->i_children)
                         playlist_ViewPlay(p_sys->p_playlist, p_playing,
                                           p_playing->pp_children[target]);
-                    PL_UNLOCK;
+                    playlist_Unlock(p_sys->p_playlist);
                 }
             }
 
@@ -207,7 +207,6 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
     return VLC_SUCCESS;
 }
 
-/* Exposed for use by timer.c via events.h */
 bool playlists_match(const char * const *a, int na,
                      const char * const *b, int nb)
 {

@@ -9,12 +9,13 @@
 
 /*
  * Snapshot the MRL list of the current playing scope.
- * Called WITHOUT p_sys->lock held (takes PL_LOCK internally).
- * Caller must call snapshot_free() on the result.
+ * Uses playlist_Lock/Unlock directly to avoid the PL_LOCK macro's
+ * requirement for a local variable named 'p_playlist'.
+ * Caller must call snapshot_free().
  */
 static inline char **playlist_snapshot(playlist_t *p_pl, int *p_count)
 {
-    PL_LOCK;
+    playlist_Lock(p_pl);
     playlist_item_t *p_playing = p_pl->p_playing;
     int n = p_playing ? p_playing->i_children : 0;
     char **ppsz = (n > 0) ? malloc((size_t)n * sizeof(char *)) : NULL;
@@ -26,7 +27,7 @@ static inline char **playlist_snapshot(playlist_t *p_pl, int *p_count)
                       : strdup("");
         }
     }
-    PL_UNLOCK;
+    playlist_Unlock(p_pl);
     *p_count = ppsz ? n : 0;
     return ppsz;
 }
@@ -40,12 +41,11 @@ static inline void snapshot_free(char **ppsz, int n)
 /*
  * Find the 0-based pp_children index of the item whose p_input matches
  * p_iitem. Returns -1 if not found.
- * Called WITHOUT p_sys->lock held (takes PL_LOCK internally).
  */
 static inline int playlist_find_index(playlist_t *p_pl, input_item_t *p_iitem)
 {
     int idx = -1;
-    PL_LOCK;
+    playlist_Lock(p_pl);
     playlist_item_t *p_playing = p_pl->p_playing;
     if (p_playing && p_iitem) {
         for (int i = 0; i < p_playing->i_children; i++) {
@@ -56,7 +56,7 @@ static inline int playlist_find_index(playlist_t *p_pl, input_item_t *p_iitem)
             }
         }
     }
-    PL_UNLOCK;
+    playlist_Unlock(p_pl);
     return idx;
 }
 

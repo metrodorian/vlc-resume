@@ -4,14 +4,13 @@
 
 #include <vlc_common.h>
 #include <vlc_interface.h>
-#include <vlc_tick.h>
+#include <vlc_mtime.h>     /* mdate(), msleep(), vlc_tick_t, VLC_TICK_FROM_SEC */
 
 #include "timer.h"
 #include "state.h"
 #include "plugin.h"
 #include "vlc_resume_utils.h"
 
-/* Interval between disk writes (5 seconds). */
 #define SAVE_INTERVAL VLC_TICK_FROM_SEC(5)
 
 void *TimerThread(void *p_data)
@@ -19,17 +18,17 @@ void *TimerThread(void *p_data)
     intf_thread_t *p_intf = (intf_thread_t *)p_data;
     intf_sys_t    *p_sys  = p_intf->p_sys;
 
-    vlc_tick_t next_save = vlc_tick_now() + SAVE_INTERVAL;
+    vlc_tick_t next_save = mdate() + SAVE_INTERVAL;
 
     for (;;) {
-        vlc_tick_t now  = vlc_tick_now();
+        vlc_tick_t now  = mdate();
         vlc_tick_t wait = next_save - now;
         if (wait > 0)
-            vlc_tick_sleep(wait);
+            msleep(wait);
 
         vlc_testcancel();
 
-        next_save = vlc_tick_now() + SAVE_INTERVAL;
+        next_save = mdate() + SAVE_INTERVAL;
 
         /* Snapshot the fields we need under lock, then release immediately.
          * Disk I/O and PL_LOCK must NOT be taken while holding p_sys->lock. */
@@ -53,8 +52,8 @@ void *TimerThread(void *p_data)
         /* Write per-track position. */
         state_save_position(psz_file, psz_mrl, i_ms);
 
-        /* Write last_session — this is what keeps playlist resume crash-safe.
-         * PL_LOCK is taken inside playlist_snapshot, never with p_sys->lock. */
+        /* Write last_session — crash-safe playlist resume.
+         * PL_LOCK taken inside playlist_snapshot, never with p_sys->lock. */
         if (i_idx >= 0) {
             int    snap_n = 0;
             char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
