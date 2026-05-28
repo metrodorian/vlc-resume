@@ -1,0 +1,90 @@
+# vlc-resume
+
+A VLC interface plugin that automatically saves the current playback position every 5 seconds and resumes from that position when the same file is played again.
+
+## Features
+
+- Works with playlists and single files
+- Position saved per MRL — multiple files tracked independently in one JSON file
+- Crash-safe: atomic write via `.tmp` + `rename()` / `MoveFileEx`
+- Skips resume if saved position is under 10 seconds (treat as "just started")
+- Deletes the entry when a track finishes cleanly (`INPUT_EVENT_EOF`)
+- No UI, no configuration needed — runs silently as a background interface module
+
+## State file
+
+Positions are stored in:
+
+| Platform | Path |
+|----------|------|
+| Linux | `~/.local/share/vlc/resume.json` |
+| macOS | `~/Library/Application Support/org.videolan.vlc/resume.json` |
+| Windows | `%APPDATA%\vlc\resume.json` |
+
+Format:
+```json
+{
+  "file:///music/track01.mp3": 183400,
+  "file:///movies/film.mkv":   5432100
+}
+```
+
+Values are milliseconds.
+
+## Build
+
+### Dependencies
+
+- CMake ≥ 3.16
+- A C11 compiler (clang or gcc)
+- VLC plugin headers
+
+**macOS (Homebrew VLC):**
+```bash
+brew install cmake
+```
+
+The headers ship inside the VLC `.app` bundle. Point CMake to them:
+```bash
+cmake -B build \
+  -DVLC_INCLUDE_DIRS=/Applications/VLC.app/Contents/MacOS/include
+cmake --build build
+```
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo apt install cmake vlc-plugin-base libvlc-dev
+cmake -B build
+cmake --build build
+```
+
+### Install
+
+```bash
+cmake --install build
+```
+
+This copies the plugin to the per-user VLC plugin directory. Restart VLC — the plugin activates automatically on startup.
+
+To verify it loaded:
+```
+Tools → Messages (Ctrl+M) → filter "resume"
+```
+
+## Architecture
+
+```
+plugin.c   — Open() / Close(), module descriptor
+events.c   — InputCurrentCallback (track change), IntfEventCallback (position/state/EOF)
+timer.c    — background thread, flushes dirty flag to disk every 5 s
+state.c    — read/write/delete entries in resume.json (atomic)
+cJSON.c/h  — embedded cJSON v1.7.17 (MIT)
+```
+
+**Resume seek timing:** the seek is performed only when `INPUT_EVENT_STATE` transitions to `PLAYING_S`. Seeking during `OPENING_S` or `BUFFERING_S` is silently ignored by VLC. The `b_resumed` flag prevents a second seek if the player briefly pauses and resumes within the same track.
+
+## Caveats
+
+- VLC plugins are **ABI-tied** to the VLC version they were compiled against. Recompile after every VLC update.
+- `p_input` can become `NULL` at any time; the code holds a reference via `vlc_object_hold()` and null-checks before every access.
+- Network streams (HLS, RTSP) use their URL as MRL — resume works but seeking accuracy depends on the server.
