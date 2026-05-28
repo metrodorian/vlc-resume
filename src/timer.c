@@ -44,7 +44,7 @@ void *TimerThread(void *p_data)
         vlc_mutex_unlock(&p_sys->lock);
 
         if (dirty && psz_mrl && psz_file && i_ms > 0)
-            state_save(psz_file, psz_mrl, i_ms);
+            state_save_position(psz_file, psz_mrl, i_ms);
 
         free(psz_mrl);
         free(psz_file);

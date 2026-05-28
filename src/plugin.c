@@ -15,6 +15,7 @@
 #include "plugin.h"
 #include "events.h"
 #include "timer.h"
+#include "state.h"
 
 static int  Open (vlc_object_t *);
 static void Close(vlc_object_t *);
@@ -38,6 +39,8 @@ static int Open(vlc_object_t *p_this)
 
     p_intf->p_sys = p_sys;
     vlc_mutex_init(&p_sys->lock);
+    p_sys->b_is_startup      = true;
+    p_sys->i_playlist_index  = -1;
 
     /* Build path to state file: <vlc-data-dir>/resume.json */
     char *psz_dir = config_GetUserDir(VLC_DATA_DIR);
@@ -97,8 +100,8 @@ static void Close(vlc_object_t *p_this)
 
     /* Final flush of dirty state. */
     if (p_sys->b_dirty && p_sys->psz_current_mrl && p_sys->i_time_ms > 0)
-        state_save(p_sys->psz_state_file, p_sys->psz_current_mrl,
-                   p_sys->i_time_ms);
+        state_save_position(p_sys->psz_state_file, p_sys->psz_current_mrl,
+                            p_sys->i_time_ms);
 
     free(p_sys->psz_current_mrl);
     free(p_sys->psz_state_file);
