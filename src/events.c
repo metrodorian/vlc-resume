@@ -182,18 +182,27 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
 
         session_t sess;
         if (session_load(psz_file, &sess)) {
-            /* Wait for the playlist to fully match the saved session. The
-             * first callback after opening an .m3u8 sees only the unexpanded
-             * container (snap_n == 1); on mismatch we leave b_resume_pending
+            /* Identify "the same playlist" loosely: the current playlist must
+             * open with the same first track as the saved session AND still
+             * contain the saved track. We deliberately do NOT require exact
+             * count/order equality — VLC may append or duplicate items (e.g.
+             * macosx-continue-playback restoring the old list alongside an
+             * explicitly opened .m3u8), which would defeat a strict compare.
+             *
+             * The first callback after opening an .m3u8 sees only the
+             * unexpanded container (snap_n == 1, snap[0] == the .m3u8 path);
+             * that fails the first-track test, so we leave b_resume_pending
              * set and retry on the next track change, by which point the
-             * playlist is expanded and matches. */
-            if (playlists_match((const char * const *)snap, snap_n,
-                                (const char * const *)sess.ppsz_tracks,
-                                sess.i_track_count))
-            {
-                int cur    = snapshot_index_of(snap, snap_n, psz_new_mrl);
-                int target = snapshot_index_of(snap, snap_n, sess.psz_mrl);
-                if (cur == 0 && target > 0) {
+             * playlist is expanded and the real first track is present. */
+            int target = snapshot_index_of(snap, snap_n, sess.psz_mrl);
+            bool same_playlist =
+                snap_n > 0 && sess.i_track_count > 0 && target >= 0
+                && snap[0] && sess.ppsz_tracks[0]
+                && strcmp(snap[0], sess.ppsz_tracks[0]) == 0;
+
+            if (same_playlist) {
+                int cur = snapshot_index_of(snap, snap_n, psz_new_mrl);
+                if (target != cur) {
                     playlist_Lock(p_sys->p_playlist);
                     playlist_item_t *p_playing = p_sys->p_playlist->p_playing;
                     if (p_playing && target < p_playing->i_children)
