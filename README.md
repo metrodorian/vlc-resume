@@ -25,12 +25,28 @@ Positions are stored in:
 Format:
 ```json
 {
-  "file:///music/track01.mp3": 183400,
-  "file:///movies/film.mkv":   5432100
+  "positions": {
+    "file:///music/track01.mp3": 183400,
+    "file:///movies/film.mkv":   5432100
+  },
+  "last_session": {
+    "tracks": ["file:///music/track01.mp3", "file:///music/track02.mp3"],
+    "index":  1,
+    "mrl":    "file:///music/track02.mp3",
+    "ms":     45200
+  }
 }
 ```
 
-Values are milliseconds.
+All times are in milliseconds.
+
+- **`positions`** — last position per file (MRL → ms), used to resume *within* a
+  track. Updated every 5 s; an entry is deleted when its track finishes cleanly.
+- **`last_session`** — the playlist that was playing, the track within it
+  (`mrl`/`index`) and its position (`ms`). Used to jump back to the right song
+  when the same playlist is reopened. The `tracks` list is the flat set of leaf
+  MRLs, so a nested input (e.g. an `.m3u8`) is stored as its real tracks, not
+  the container.
 
 ## Build
 
@@ -129,14 +145,30 @@ VLC_PLUGIN_PATH="$HOME/.local/lib/vlc/plugins" \
 ## Architecture
 
 ```
-plugin.c   — Open() / Close(), module descriptor
-events.c   — InputCurrentCallback (track change), IntfEventCallback (position/state)
-timer.c    — background thread, flushes dirty flag to disk every 5 s
-state.c    — read/write/delete entries in resume.json (atomic)
-cJSON.c/h  — embedded cJSON v1.7.17 (MIT)
+plugin.c           — Open() / Close(), module descriptor
+events.c           — InputCurrentCallback (track change), IntfEventCallback (position/state)
+timer.c            — background thread: 200 ms poll loop; deferred seek, playlist
+                     resume jump, and a disk flush every 5 s
+state.c            — read/write/delete positions + last_session in resume.json (atomic)
+vlc_resume_utils.h — recursive leaf snapshot of the playlist + MRL lookup helpers
+cJSON.c/h          — embedded cJSON v1.7.17 (MIT)
 ```
 
-**Resume seek timing:** the seek is performed only when `INPUT_EVENT_STATE` transitions to `PLAYING_S`. Seeking during `OPENING_S` or `BUFFERING_S` is silently ignored by VLC. The `b_resumed` flag prevents a second seek if the player briefly pauses and resumes within the same track.
+**Resume seek timing.** A position seek is wanted only once `INPUT_EVENT_STATE`
+reaches `PLAYING_S` (seeking during `OPENING_S`/`BUFFERING_S` is ignored by VLC).
+But that callback runs on the input event thread, where a blocking
+`var_SetInteger("time")` would deadlock — so the callback only *flags* the seek
+(`b_seek_pending`) and the timer thread performs it. The `b_resumed` flag
+prevents a second seek if the player briefly pauses within the same track.
+
+**Playlist resume jump.** Opening an `.m3u8` expands asynchronously, often only
+*after* the first track is already playing, with no further track-change
+callback. The jump therefore lives in the timer's 200 ms poll, not in a
+callback: it retries until the live playlist matches the saved session, jumps to
+the saved track by MRL, and re-asserts if VLC's own autoplay clobbers it —
+bounded by an 8 s deadline so it never fights a user navigating manually. Saving
+`last_session` is suppressed while a jump is pending (and for container-only
+snapshots) so the save path can't overwrite the data being read to resume.
 
 ## Caveats
 
