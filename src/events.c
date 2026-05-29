@@ -142,16 +142,35 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
     if (b_dirty && psz_old_mrl && psz_file && i_old_ms > 0)
         state_save_position(psz_file, psz_old_mrl, i_old_ms);
 
-    /* Do NOT persist a session while a resume jump is still pending (it would
-     * clobber the data being read to resume) or for a container-only snapshot
-     * (snap_n < 2, the .m3u8 before expansion). See timer.c for rationale. */
+    /* Do NOT persist a session while a resume jump is still pending (would
+     * clobber data being read to resume), for container-only snapshots
+     * (snap_n < 2), or if the leaving track is not part of the saved session
+     * (same external-file guard as in timer.c — see there for rationale). */
     if (!b_pending && psz_old_mrl && psz_file) {
         int    snap_n = 0;
         char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
         int    idx    = snapshot_index_of(snap, snap_n, psz_old_mrl);
-        if (snap && snap_n >= 2 && idx >= 0)
-            session_save(psz_file, (const char * const *)snap, snap_n,
-                         idx, psz_old_mrl, i_old_ms);
+        if (snap && snap_n >= 2 && idx >= 0) {
+            /* Same in_sess + save_n cap as in timer.c — see there for the
+             * full rationale. The snapshot here already includes any file
+             * VLC just appended, so capping save_n keeps it out of the
+             * saved track list even when the leaving track is legitimate. */
+            session_t old = {0};
+            bool has_old  = session_load(psz_file, &old);
+            bool in_sess  = !has_old;
+            int  save_n   = snap_n;
+            for (int i = 0; i < old.i_track_count && !in_sess; i++)
+                if (old.ppsz_tracks[i]
+                    && strcmp(old.ppsz_tracks[i], psz_old_mrl) == 0)
+                    in_sess = true;
+            if (has_old && in_sess && old.i_track_count < snap_n)
+                save_n = old.i_track_count;
+            if (has_old) session_free(&old);
+
+            if (in_sess && idx < save_n)
+                session_save(psz_file, (const char * const *)snap, save_n,
+                             idx, psz_old_mrl, i_old_ms);
+        }
         snapshot_free(snap, snap_n);
     }
 

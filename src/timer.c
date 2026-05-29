@@ -163,13 +163,54 @@ void *TimerThread(void *p_data)
          * to resume. Also require a real multi-track playlist (snap_n >= 2):
          * during the brief pre-expansion window an .m3u8 snapshots as a single
          * container item, and persisting that destroys the saved session. */
+        /* Write last_session — crash-safe playlist resume.
+         * PL_LOCK taken inside playlist_snapshot, never with p_sys->lock.
+         * Derive the index from the snapshot by MRL: skips container items
+         * (e.g. the .m3u8 itself) whose MRL is not among the real tracks.
+         *
+         * Guards:
+         *  • skip while b_resume_pending (would clobber data being read)
+         *  • skip for container-only snapshots (snap_n < 2)
+         *  • skip if the currently playing track is NOT part of the saved
+         *    session — this protects against VLC appending a random external
+         *    file to the playlist (e.g. user opens Vanilla Ice while a
+         *    playlist is running). Without this guard the session mrl/index
+         *    would be overwritten with the external file, and the next open
+         *    of the original playlist would find target=-1 and never jump. */
         if (!b_pending) {
             int    snap_n = 0;
             char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
             int    idx    = snapshot_index_of(snap, snap_n, psz_mrl);
-            if (snap && snap_n >= 2 && idx >= 0)
-                session_save(psz_file, (const char * const *)snap, snap_n,
-                             idx, psz_mrl, i_ms);
+            if (snap && snap_n >= 2 && idx >= 0) {
+                /* Only save if the current track belongs to the existing
+                 * session's original track list, AND cap the saved track
+                 * count to that list's length. This prevents an externally
+                 * appended file (e.g. the user opens Vanilla Ice while a
+                 * playlist is running) from ever entering the session:
+                 *   – the in_sess check stops saving once the alien track
+                 *     is current;
+                 *   – the save_n cap stops the alien track from being
+                 *     written into "tracks" even during the transition
+                 *     callback (where the snapshot already includes it but
+                 *     the leaving track is still a legitimate playlist item).
+                 * On first run (no prior session) we fall through and save
+                 * the full snapshot. */
+                session_t old = {0};
+                bool has_old  = session_load(psz_file, &old);
+                bool in_sess  = !has_old;
+                int  save_n   = snap_n;
+                for (int i = 0; i < old.i_track_count && !in_sess; i++)
+                    if (old.ppsz_tracks[i]
+                        && strcmp(old.ppsz_tracks[i], psz_mrl) == 0)
+                        in_sess = true;
+                if (has_old && in_sess && old.i_track_count < snap_n)
+                    save_n = old.i_track_count; /* cap: never grow the list */
+                if (has_old) session_free(&old);
+
+                if (in_sess && idx < save_n)
+                    session_save(psz_file, (const char * const *)snap, save_n,
+                                 idx, psz_mrl, i_ms);
+            }
             snapshot_free(snap, snap_n);
         }
 
