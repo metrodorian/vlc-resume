@@ -106,6 +106,16 @@ launchctl load ~/Library/LaunchAgents/org.videolan.vlc.pluginpath.plist
 launchctl getenv VLC_PLUGIN_PATH   # should print the plugin dir
 ```
 
+**3. Disable VLC's own "continue where you left off" on macOS.**
+VLC's native resume (`macosx-continue-playback`) restores the last item *and*
+duplicates the playlist on launch, which races against this plugin's resume and
+produces wrong/no jumps. Set it to *Never* so the plugin is the single source of
+truth — in `vlcrc`:
+```ini
+macosx-continue-playback=2
+```
+(Or in the GUI: Preferences → Interface → "Continue playback?" → Never.)
+
 Restart VLC. To verify the plugin loaded:
 ```
 Tools → Messages (Ctrl+M) → filter "resume"

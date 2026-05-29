@@ -142,11 +142,14 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
     if (b_dirty && psz_old_mrl && psz_file && i_old_ms > 0)
         state_save_position(psz_file, psz_old_mrl, i_old_ms);
 
-    if (psz_old_mrl && psz_file) {
+    /* Do NOT persist a session while a resume jump is still pending (it would
+     * clobber the data being read to resume) or for a container-only snapshot
+     * (snap_n < 2, the .m3u8 before expansion). See timer.c for rationale. */
+    if (!b_pending && psz_old_mrl && psz_file) {
         int    snap_n = 0;
         char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
         int    idx    = snapshot_index_of(snap, snap_n, psz_old_mrl);
-        if (snap && snap_n > 0 && idx >= 0)
+        if (snap && snap_n >= 2 && idx >= 0)
             session_save(psz_file, (const char * const *)snap, snap_n,
                          idx, psz_old_mrl, i_old_ms);
         snapshot_free(snap, snap_n);
@@ -171,57 +174,12 @@ int InputCurrentCallback(vlc_object_t *p_obj, const char *psz_var,
         var_AddCallback(p_input_new, "intf-event", IntfEventCallback, p_intf);
     }
 
-    /* ---- 5. One-time playlist resume jump. ------------------------------
-     * Defer the decision until the arriving track is a real playlist member.
-     * Opening an .m3u8 first plays the container item (its MRL is not in the
-     * expanded track list); we skip that and keep b_resume_pending set until
-     * the first real track arrives, by which time the playlist is populated. */
-    if (b_pending && p_input_new && psz_file && psz_new_mrl) {
-        int    snap_n = 0;
-        char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
-
-        session_t sess;
-        if (session_load(psz_file, &sess)) {
-            /* Identify "the same playlist" loosely: the current playlist must
-             * open with the same first track as the saved session AND still
-             * contain the saved track. We deliberately do NOT require exact
-             * count/order equality — VLC may append or duplicate items (e.g.
-             * macosx-continue-playback restoring the old list alongside an
-             * explicitly opened .m3u8), which would defeat a strict compare.
-             *
-             * The first callback after opening an .m3u8 sees only the
-             * unexpanded container (snap_n == 1, snap[0] == the .m3u8 path);
-             * that fails the first-track test, so we leave b_resume_pending
-             * set and retry on the next track change, by which point the
-             * playlist is expanded and the real first track is present. */
-            int target = snapshot_index_of(snap, snap_n, sess.psz_mrl);
-            bool same_playlist =
-                snap_n > 0 && sess.i_track_count > 0 && target >= 0
-                && snap[0] && sess.ppsz_tracks[0]
-                && strcmp(snap[0], sess.ppsz_tracks[0]) == 0;
-
-            if (same_playlist) {
-                int cur = snapshot_index_of(snap, snap_n, psz_new_mrl);
-                if (target != cur) {
-                    playlist_Lock(p_sys->p_playlist);
-                    playlist_item_t *p_playing = p_sys->p_playlist->p_playing;
-                    if (p_playing && target < p_playing->i_children)
-                        playlist_ViewPlay(p_sys->p_playlist, p_playing,
-                                          p_playing->pp_children[target]);
-                    playlist_Unlock(p_sys->p_playlist);
-                }
-
-                /* Decision made once the playlist matches — stop retrying. */
-                vlc_mutex_lock(&p_sys->lock);
-                p_sys->b_resume_pending = false;
-                vlc_mutex_unlock(&p_sys->lock);
-            }
-            session_free(&sess);
-        }
-
-        snapshot_free(snap, snap_n);
-    }
-
+    /* ---- 5. Playlist resume jump is handled by the timer thread. ---------
+     * It is NOT done here: opening an .m3u8 expands asynchronously, often
+     * only AFTER the first track has started playing, and no further
+     * track-change callback is guaranteed. The timer polls every 200ms and
+     * retries the jump until the playlist has expanded enough to match the
+     * saved session (b_resume_pending gates that one-time action). */
     free(psz_file);
     return VLC_SUCCESS;
 }

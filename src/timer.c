@@ -22,6 +22,15 @@ void *TimerThread(void *p_data)
 
     vlc_tick_t next_save = mdate() + SAVE_INTERVAL;
 
+    /* Resume-jump state, persisted across poll iterations (timer is single
+     * threaded). We keep re-asserting the jump until the target track is
+     * confirmed playing and stable, because VLC's own autoplay of track 0 can
+     * fire AFTER our jump and clobber it. A deadline bounds the assertion so
+     * we never fight a user who manually navigates right after opening. */
+    vlc_tick_t resume_start  = 0;   /* first poll the playlist matched */
+    vlc_tick_t target_since  = 0;   /* first poll cur == target observed */
+    vlc_tick_t last_jump     = 0;   /* last ViewPlay issue (rate limit) */
+
     for (;;) {
         msleep(POLL_INTERVAL);
         vlc_testcancel();
@@ -48,6 +57,75 @@ void *TimerThread(void *p_data)
             vlc_object_release(p_seek);
         }
 
+        /* One-time playlist resume jump. Retried every poll until the
+         * playlist has expanded enough to match the saved session. Doing it
+         * here (rather than in a track-change callback) is what makes it
+         * reliable: an .m3u8 expands asynchronously, frequently after the
+         * first track is already playing, with no further callback to react
+         * to. We jump to wherever the saved track now sits in the playlist. */
+        vlc_mutex_lock(&p_sys->lock);
+        bool  do_resume   = p_sys->b_resume_pending && p_sys->p_input
+                            && p_sys->psz_current_mrl && p_sys->psz_state_file;
+        char *cur_mrl     = do_resume ? strdup(p_sys->psz_current_mrl)  : NULL;
+        char *resume_file = do_resume ? strdup(p_sys->psz_state_file)   : NULL;
+        vlc_mutex_unlock(&p_sys->lock);
+
+        if (do_resume && cur_mrl && resume_file) {
+            vlc_tick_t now = mdate();
+            if (resume_start == 0)
+                resume_start = now;
+            /* Bound the whole resume attempt. After this we stop trying (and,
+             * crucially, allow session saving again) whether or not we ever
+             * found a matching session — otherwise a fresh start with no saved
+             * session would keep b_resume_pending set forever and never save. */
+            bool give_up = (now - resume_start) > VLC_TICK_FROM_SEC(8);
+            bool done    = false;
+
+            int       snap_n = 0;
+            char    **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
+            session_t sess;
+            if (session_load(resume_file, &sess)) {
+                int  target = snapshot_index_of(snap, snap_n, sess.psz_mrl);
+                bool same   = snap_n > 0 && sess.i_track_count > 0
+                              && target >= 0 && snap[0] && sess.ppsz_tracks[0]
+                              && strcmp(snap[0], sess.ppsz_tracks[0]) == 0;
+                if (same) {
+                    int cur = snapshot_index_of(snap, snap_n, cur_mrl);
+                    if (cur == target) {
+                        /* Arrived. Require it to stay put briefly so a late
+                         * autoplay clobber is caught and re-corrected. */
+                        if (target_since == 0)
+                            target_since = now;
+                        if ((now - target_since) > VLC_TICK_FROM_MS(1200))
+                            done = true;
+                    } else {
+                        target_since = 0; /* not there / clobbered — re-assert */
+                        if (!give_up
+                            && (now - last_jump) > VLC_TICK_FROM_MS(500)) {
+                            last_jump = now;
+                            playlist_Lock(p_sys->p_playlist);
+                            playlist_item_t *it = playlist_find_item_by_mrl(
+                                p_sys->p_playlist->p_playing, sess.psz_mrl);
+                            if (it && it->p_parent)
+                                playlist_ViewPlay(p_sys->p_playlist,
+                                                  it->p_parent, it);
+                            playlist_Unlock(p_sys->p_playlist);
+                        }
+                    }
+                }
+                session_free(&sess);
+            }
+            snapshot_free(snap, snap_n);
+
+            if (done || give_up) {
+                vlc_mutex_lock(&p_sys->lock);
+                p_sys->b_resume_pending = false;
+                vlc_mutex_unlock(&p_sys->lock);
+            }
+        }
+        free(cur_mrl);
+        free(resume_file);
+
         if (mdate() < next_save)
             continue;
 
@@ -56,13 +134,14 @@ void *TimerThread(void *p_data)
         /* Snapshot the fields we need under lock, then release immediately.
          * Disk I/O and PL_LOCK must NOT be taken while holding p_sys->lock. */
         vlc_mutex_lock(&p_sys->lock);
-        bool    b_dirty  = p_sys->b_dirty;
-        char   *psz_mrl  = (b_dirty && p_sys->psz_current_mrl)
-                           ? strdup(p_sys->psz_current_mrl) : NULL;
-        int64_t i_ms     = p_sys->i_time_ms;
-        char   *psz_file = (b_dirty && p_sys->psz_state_file)
-                           ? strdup(p_sys->psz_state_file) : NULL;
-        p_sys->b_dirty   = false;
+        bool    b_dirty   = p_sys->b_dirty;
+        bool    b_pending = p_sys->b_resume_pending;
+        char   *psz_mrl   = (b_dirty && p_sys->psz_current_mrl)
+                            ? strdup(p_sys->psz_current_mrl) : NULL;
+        int64_t i_ms      = p_sys->i_time_ms;
+        char   *psz_file  = (b_dirty && p_sys->psz_state_file)
+                            ? strdup(p_sys->psz_state_file) : NULL;
+        p_sys->b_dirty    = false;
         vlc_mutex_unlock(&p_sys->lock);
 
         if (!b_dirty || !psz_mrl || !psz_file || i_ms <= 0) {
@@ -77,12 +156,18 @@ void *TimerThread(void *p_data)
         /* Write last_session — crash-safe playlist resume.
          * PL_LOCK taken inside playlist_snapshot, never with p_sys->lock.
          * Derive the index from the snapshot by MRL: skips container items
-         * (e.g. the .m3u8 itself) whose MRL is not among the real tracks. */
-        {
+         * (e.g. the .m3u8 itself) whose MRL is not among the real tracks.
+         *
+         * Guards (critical): do NOT overwrite the session while a resume jump
+         * is still pending — that would clobber the very data we are reading
+         * to resume. Also require a real multi-track playlist (snap_n >= 2):
+         * during the brief pre-expansion window an .m3u8 snapshots as a single
+         * container item, and persisting that destroys the saved session. */
+        if (!b_pending) {
             int    snap_n = 0;
             char **snap   = playlist_snapshot(p_sys->p_playlist, &snap_n);
             int    idx    = snapshot_index_of(snap, snap_n, psz_mrl);
-            if (snap && snap_n > 0 && idx >= 0)
+            if (snap && snap_n >= 2 && idx >= 0)
                 session_save(psz_file, (const char * const *)snap, snap_n,
                              idx, psz_mrl, i_ms);
             snapshot_free(snap, snap_n);
